@@ -1,0 +1,72 @@
+name: 美股每小时情报
+
+on:
+  schedule:
+    # GitHub cron uses UTC. Run hourly across both US daylight/standard time;
+    # the Python entry point gates by America/New_York session and NYSE calendar.
+    - cron: '15 11-21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      send_to_telegram:
+        description: '发送到 Telegram'
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: us-market-intelligence
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  intelligence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 生成美股情报
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
+          US_INTELLIGENCE_WATCHLIST: ${{ vars.US_INTELLIGENCE_WATCHLIST || secrets.US_INTELLIGENCE_WATCHLIST }}
+          REPORT_LANGUAGE: zh
+          NEWS_STRATEGY_PROFILE: ultra_short
+          NEWS_MAX_AGE_DAYS: '1'
+        shell: bash
+        run: |
+          args=()
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            args+=(--scheduled)
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.send_to_telegram }}" != "true" ]; then
+            args+=(--no-send)
+          fi
+          python scripts/us_market_intelligence.py "${args[@]}"
+
+      - name: 上传情报报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: us-market-intelligence-${{ github.run_number }}
+          path: reports/us-market-intelligence.md
+          if-no-files-found: warn
+          retention-days: 14
