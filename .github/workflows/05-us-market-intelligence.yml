@@ -19,6 +19,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   intelligence:
@@ -36,6 +37,32 @@ jobs:
 
       - name: 安装依赖
         run: pip install -r requirements.txt
+
+      - name: 恢复最近市场快照
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p data/us-market-intelligence
+          run_id=$(gh run list \
+            --workflow 05-us-market-intelligence.yml \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" --name us-market-intelligence-state --dir .state-restore
+            if [ -d .state-restore/data/us-market-intelligence ]; then
+              cp -R .state-restore/data/us-market-intelligence/. data/us-market-intelligence/
+              echo "Restored nested snapshot state from run $run_id"
+            elif [ -f .state-restore/latest.json ] || [ -d .state-restore/snapshots ]; then
+              cp -R .state-restore/. data/us-market-intelligence/
+              echo "Restored flattened snapshot state from run $run_id"
+            fi
+          else
+            echo "No previous successful state artifact; current run will establish the baseline"
+          fi
 
       - name: 生成美股情报
         env:
@@ -67,6 +94,17 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: us-market-intelligence-${{ github.run_number }}
-          path: reports/us-market-intelligence.md
+          path: |
+            reports/us-market-intelligence.md
+            reports/us-market-intelligence.json
           if-no-files-found: warn
           retention-days: 14
+
+      - name: 保存市场快照状态
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: us-market-intelligence-state
+          path: data/us-market-intelligence/
+          if-no-files-found: warn
+          retention-days: 35

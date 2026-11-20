@@ -19,13 +19,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.services.us_market_intelligence import (  # noqa: E402
     NEW_YORK,
-    build_prompt,
-    compose_report,
     configured_watchlist_from_env,
-    deterministic_report,
-    run_us_market_intelligence,
     should_run_scheduled,
 )
+from src.services.us_market_intelligence_engine import run_intelligence_engine  # noqa: E402
+from src.services.us_market_intelligence_history import USMarketIntelligenceHistory  # noqa: E402
 
 logger = logging.getLogger("us_market_intelligence")
 
@@ -36,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-send", action="store_true", help="Generate the report without Telegram delivery")
     parser.add_argument("--sample", action="store_true", help="Use deterministic offline sample data and no external APIs")
     parser.add_argument("--output", default="reports/us-market-intelligence.md", help="Markdown output path")
+    parser.add_argument("--json-output", default="reports/us-market-intelligence.json", help="Structured JSON output path")
+    parser.add_argument("--history-dir", default="data/us-market-intelligence", help="Persistent snapshot directory")
     return parser.parse_args()
 
 
@@ -67,15 +67,24 @@ def _sample_config():
     return SimpleNamespace(stock_list=["AAPL", "MSFT", "NVDA"], brave_api_keys=[])
 
 
-def _generate_analysis(config, prompt: str) -> tuple[str, str]:
+def _generate_analysis(config, prompt: str) -> tuple[str, str, str]:
     from src.analyzer import GeminiAnalyzer
 
     analyzer = GeminiAnalyzer(config=config)
     result = analyzer.generate_text_with_metadata(prompt, max_tokens=2200, temperature=0.2)
     if result is None or not result.text.strip():
-        return "", "LLM unavailable"
-    identity = "/".join(part for part in (result.provider, result.model) if part)
-    return result.text.strip(), identity or "configured LLM"
+        return "", "", ""
+    return result.text.strip(), result.provider or "", result.model or ""
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        temp_path.write_text(content, encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -91,40 +100,60 @@ def main() -> int:
 
     if args.sample:
         config = _sample_config()
-        data = run_us_market_intelligence(
-            config,
-            watchlist=config.stock_list,
-            now=now,
-            download=_sample_download,
-        )
-        analysis = deterministic_report(data)
-        model_identity = "offline sample"
+        watchlist = config.stock_list
+        generator = None
+        sample_download = _sample_download
     else:
         from src.config import get_config
 
         config = get_config()
         watchlist = configured_watchlist_from_env() or list(getattr(config, "stock_list", []) or [])
-        data = run_us_market_intelligence(config, watchlist=watchlist, now=now)
-        analysis, model_identity = _generate_analysis(config, build_prompt(data))
-        if not analysis:
-            analysis = deterministic_report(data)
-            data.warnings.append("LLM 生成失败，已使用确定性模板")
 
-    report = compose_report(data, analysis)
-    report += f"\n\n<!-- generation: {model_identity} -->\n"
+        def generator(prompt: str) -> tuple[str, str, str]:
+            return _generate_analysis(config, prompt)
+
+        sample_download = None
+
+    history = USMarketIntelligenceHistory(PROJECT_ROOT / args.history_dir)
+    result = run_intelligence_engine(
+        config,
+        watchlist=watchlist,
+        now=now,
+        download=sample_download,
+        generate=generator,
+        history=history,
+        validate_news_links=not args.sample,
+    )
+    report = result.report
+    generation = "/".join(
+        part for part in (result.snapshot.intelligence.provider, result.snapshot.intelligence.model) if part
+    ) or result.snapshot.intelligence.status
+    report += f"\n\n<!-- generation: {generation} -->\n"
+    result.snapshot.report_markdown = report
 
     output_path = PROJECT_ROOT / args.output
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(report, encoding="utf-8")
-    logger.info("Report written to %s", output_path)
+    json_output_path = PROJECT_ROOT / args.json_output
+    _atomic_write_text(output_path, report)
+    _atomic_write_text(
+        json_output_path,
+        json.dumps(result.snapshot.to_json_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+    )
+    logger.info("Reports written to %s and %s", output_path, json_output_path)
 
     summary = {
-        "session": data.session_label,
-        "quotes": len(data.quotes),
-        "news": len(data.news),
-        "warnings": data.warnings,
-        "generation": model_identity,
+        "snapshot_id": result.snapshot.snapshot_id,
+        "session": result.data.session_label,
+        "quotes": len(result.data.quotes),
+        "news": len(result.data.news),
+        "anomalies": len(result.snapshot.anomalies),
+        "previous_hour": result.snapshot.comparison.previous_hour.status,
+        "previous_trading_day": result.snapshot.comparison.previous_trading_day.status,
+        "data_quality": result.snapshot.data_quality.overall_status,
+        "warnings": result.data.warnings,
+        "generation": generation,
         "output": str(output_path),
+        "json_output": str(json_output_path),
+        "history_path": str(result.history_path) if result.history_path else None,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

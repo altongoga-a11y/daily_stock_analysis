@@ -10,6 +10,9 @@
 - `US_INTELLIGENCE_WATCHLIST` 或既有 `STOCK_LIST` 中的大盘股
 - Brave Search 返回的近期市场主线、板块轮动、美国经济日历与重要财报新闻
 - OpenAI/LiteLLM 生成的中文情报摘要和未来 1–3 小时观察项
+- 每条行情的来源、provider 时间、纽约市场时间、交易时段、TTL 与校验状态
+- 上一小时和上一交易日变化、确定性异常预警及证据引用
+- 同快照 ID 的中文 Markdown 与供其他机器人调用的结构化 JSON
 
 ## GitHub 配置
 
@@ -36,6 +39,16 @@ US_INTELLIGENCE_WATCHLIST=AAPL,MSFT,NVDA,GOOGL,AMZN,META,JPM,XOM,LLY,WMT,CAT,NEE
 
 首次部署后，在 GitHub 的 **Actions → 美股每小时情报 → Run workflow** 手动运行。可以选择只生成 artifact、不发送 Telegram。
 
+工作流会从最近一次成功运行的 `us-market-intelligence-state` artifact 恢复历史快照，并在成功后保存新状态。因此 GitHub 托管 Runner 也能比较上一小时和上一交易日。第一次运行、artifact 过期或恢复失败时，当次报告仍会生成，但比较状态会明确标记为 `no_baseline`。
+
+## 输出契约
+
+- 人类报告：`reports/us-market-intelligence.md`
+- 机器人 JSON：`reports/us-market-intelligence.json`
+- 历史快照：`data/us-market-intelligence/snapshots/YYYY-MM-DD/<snapshot_id>.json`
+
+JSON 使用版本化严格 Schema。行情事实固定标记为 `confirmed_fact`；规则计算结论为 `data_inference`；新闻潜在驱动为 `unverified_hypothesis`。新闻与价格同时出现不代表因果，AI Prompt 和结构化字段均禁止自动确认因果关系。
+
 ## 本地验证
 
 离线样例不会调用行情、搜索、LLM 或 Telegram：
@@ -50,12 +63,15 @@ python scripts/us_market_intelligence.py --sample --no-send
 python scripts/us_market_intelligence.py --no-send
 ```
 
+离线样例会同时生成 Markdown、JSON 和版本化快照；重复运行可以验证基线读取与原子覆盖。
+
 ## 数据边界
 
 - 行情来自 Yahoo Finance 的最新可用数据，可能延迟、缺字段或受限流影响，不是交易所直连实时行情。
 - 行业轮动基于 11 个行业 ETF 相对 SPY 的当日涨跌表现，是价格强弱代理，不等于完整资金流统计。
-- Brave Search 用于发现新闻线索。搜索标题和摘要不能替代 SEC 文件、公司投资者关系公告、BLS、BEA、Federal Reserve 等原始来源。
-- 任一行情、新闻或 LLM 环节失败时，脚本保留其他可用数据；LLM 失败会退回确定性 Markdown 报告。
+- Brave Search 用于发现新闻线索。每条结果会检查 URL 格式、HTTP 可达性和发布时间，但这些检查不能替代 SEC 文件、公司投资者关系公告、BLS、BEA、Federal Reserve 等原始来源。
+- 新闻链接缺时间、不可达、过期或时间在未来时会降级对应证据，不会阻断整份报告。
+- 任一行情、新闻、历史恢复或 LLM 环节失败时，脚本保留其他可用数据；LLM 失败会退回确定性 Markdown 与 JSON 输出。
 
 ## 回滚
 
