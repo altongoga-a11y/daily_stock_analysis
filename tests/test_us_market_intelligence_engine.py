@@ -17,6 +17,7 @@ from src.schemas.us_market_intelligence import (
 from src.services.us_market_intelligence import (
     NewsItem,
     SECTOR_SYMBOLS,
+    fetch_us_market_snapshot,
     market_session,
     validate_news_item,
 )
@@ -79,8 +80,11 @@ def _fake_download(symbols, *, interval, **_kwargs):
         index = pd.DatetimeIndex([now - pd.Timedelta(minutes=5), now])
         frames = {symbol: pd.DataFrame({"Close": [100, 101]}, index=index) for symbol in tickers}
     else:
-        index = pd.DatetimeIndex([now.normalize() - pd.Timedelta(days=2), now.normalize() - pd.Timedelta(days=1)])
-        frames = {symbol: pd.DataFrame({"Close": [99, 100]}, index=index) for symbol in tickers}
+        index = pd.date_range(end=now.normalize() - pd.Timedelta(days=1), periods=160, freq="B", tz=NY)
+        frames = {
+            symbol: pd.DataFrame({"Close": [90 + row * 0.0625 for row in range(160)]}, index=index)
+            for symbol in tickers
+        }
     return pd.concat(frames, axis=1)
 
 
@@ -112,6 +116,21 @@ def test_news_validation_checks_url_reachability_and_publication_time():
     assert "published_at_in_future" in invalid.validation_reasons
 
 
+def test_news_source_is_derived_from_url_and_duplicate_titles_can_be_normalized():
+    from src.services.us_market_intelligence import _canonical_news_title, _clean_news_result
+
+    result = SimpleNamespace(
+        title="Same Market Headline",
+        url="https://reuters.com/markets/story",
+        source="wrong-source.example",
+        published_date="2026-11-19",
+        snippet="summary",
+    )
+    cleaned = _clean_news_result(result, "市场主线", "2026-11-19T17:00:00+00:00")
+    assert cleaned.source == "reuters.com"
+    assert _canonical_news_title("Same—Market Headline!") == _canonical_news_title("same market headline")
+
+
 def test_market_session_covers_premarket_intraday_postmarket_and_weekend(monkeypatch):
     class _Calendar:
         @staticmethod
@@ -131,6 +150,26 @@ def test_market_session_covers_premarket_intraday_postmarket_and_weekend(monkeyp
     assert market_session(datetime(2026, 11, 19, 10, 0, tzinfo=NY)) == "intraday"
     assert market_session(datetime(2026, 11, 19, 16, 5, tzinfo=NY)) == "postmarket"
     assert market_session(datetime(2026, 11, 21, 10, 0, tzinfo=NY)) == "non_trading"
+
+
+def test_postmarket_completed_quotes_use_overnight_ttl():
+    now = datetime(2026, 11, 19, 21, 7, tzinfo=NY)
+    quotes, _warnings = fetch_us_market_snapshot(["AAPL"], now=now, download=_fake_download)
+    assert quotes["AAPL"].market_session == "postmarket"
+    assert quotes["AAPL"].ttl_seconds == 18 * 60 * 60
+    assert quotes["AAPL"].validation_status == "valid"
+
+
+def test_multihorizon_returns_are_collected_for_sector_rotation():
+    quotes, _warnings = fetch_us_market_snapshot(
+        ["AAPL"],
+        now=datetime(2026, 11, 19, 12, 0, tzinfo=NY),
+        download=_fake_download,
+    )
+    assert set(quotes["XLK"].horizon_returns) == {"1d", "5d", "1m", "3m", "6m"}
+    expected_1d = round((101.0 - (90 + 159 * 0.0625)) / (90 + 159 * 0.0625) * 100, 2)
+    assert quotes["XLK"].horizon_returns["1d"] == expected_1d
+    assert quotes["XLK"].horizon_returns["6m"] is not None
 
 
 def test_market_session_respects_half_day_close(monkeypatch):
@@ -223,3 +262,10 @@ def test_engine_emits_same_snapshot_id_in_markdown_json_contract_and_history(tmp
     assert len([item for item in result.snapshot.quotes if item.symbol in SECTOR_SYMBOLS]) == 11
     assert all(item.provenance.provider == "Yahoo Finance" for item in result.snapshot.quotes)
     assert result.snapshot.intelligence.status == "generated"
+    assert result.report.index("经济周期") < result.report.index("数据附录：核心市场")
+    assert "多周期行业轮动" in result.report
+    assert "未来1个交易日" in result.report
+    assert "未来1个月" in result.report
+    assert "未来3个月" in result.report
+    assert "未来6个月" in result.report
+    assert "值得关注的相对强势股票" in result.report

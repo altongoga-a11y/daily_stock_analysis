@@ -12,6 +12,9 @@
 - OpenAI/LiteLLM 生成的中文情报摘要和未来 1–3 小时观察项
 - 每条行情的来源、provider 时间、纽约市场时间、交易时段、TTL 与校验状态
 - 上一小时和上一交易日变化、确定性异常预警及证据引用
+- 1日、5日、1个月、3个月、6个月行业相对 SPY 轮动与条件情景
+- 经济周期、金融主线、主要矛盾、跨资产验证和相对强势观察股
+- 逐条合格新闻的结论、潜在影响、主线映射与验证要求
 - 同快照 ID 的中文 Markdown 与供其他机器人调用的结构化 JSON
 
 ## GitHub 配置
@@ -29,7 +32,7 @@
 US_INTELLIGENCE_WATCHLIST=AAPL,MSFT,NVDA,GOOGL,AMZN,META,JPM,XOM,LLY,WMT,CAT,NEE
 ```
 
-未设置时会读取既有 `STOCK_LIST`。如需指定 OpenAI 模型，可设置 `OPENAI_MODEL`；不应把 API Key 放入 Repository Variables。
+未设置时会读取既有 `STOCK_LIST`。工作流对官方 OpenAI Key 默认使用 `gpt-4o-mini`；如需其他模型，可通过 Repository Variable `OPENAI_MODEL` 覆盖。API Key 不应放入 Repository Variables。模型不可用、权限不足、余额或配额问题会记录在报告数据边界和 JSON warnings 中，确定性策略报告仍会生成。
 
 ## 调度
 
@@ -67,7 +70,7 @@ python scripts/us_market_intelligence.py --no-send
 
 ## 数据边界
 
-- 行情来自 Yahoo Finance 的最新可用数据，可能延迟、缺字段或受限流影响，不是交易所直连实时行情。
+- 行情来自 Yahoo Finance 的最新可用数据，可能延迟、缺字段或受限流影响，不是交易所直连实时行情。盘中默认 15 分钟 TTL；盘后已完成交易时段的数据按隔夜有效处理，避免把正常收盘数据误报为陈旧。
 - 行业轮动基于 11 个行业 ETF 相对 SPY 的当日涨跌表现，是价格强弱代理，不等于完整资金流统计。
 - Brave Search 用于发现新闻线索。每条结果会检查 URL 格式、HTTP 可达性和发布时间，但这些检查不能替代 SEC 文件、公司投资者关系公告、BLS、BEA、Federal Reserve 等原始来源。
 - 新闻链接缺时间、不可达、过期或时间在未来时会降级对应证据，不会阻断整份报告。

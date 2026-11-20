@@ -52,10 +52,13 @@ def _sample_download(symbols, *, interval, **_kwargs):
             for index_pos, symbol in enumerate(tickers)
         }
     else:
-        index = pd.DatetimeIndex([now.normalize() - pd.Timedelta(days=2), now.normalize() - pd.Timedelta(days=1)])
+        index = pd.date_range(end=now.normalize() - pd.Timedelta(days=1), periods=160, freq="B", tz=NEW_YORK)
         frames = {
             symbol: pd.DataFrame(
-                {"Close": [99.0 + index_pos, 100.0 + index_pos], "Volume": [900, 1000]},
+                {
+                    "Close": [80.0 + index_pos + row * (0.10 + index_pos * 0.002) for row in range(160)],
+                    "Volume": [900 + row for row in range(160)],
+                },
                 index=index,
             )
             for index_pos, symbol in enumerate(tickers)
@@ -71,9 +74,12 @@ def _generate_analysis(config, prompt: str) -> tuple[str, str, str]:
     from src.analyzer import GeminiAnalyzer
 
     analyzer = GeminiAnalyzer(config=config)
-    result = analyzer.generate_text_with_metadata(prompt, max_tokens=2200, temperature=0.2)
-    if result is None or not result.text.strip():
-        return "", "", ""
+    result = analyzer.generate_text_with_metadata(prompt, max_tokens=3200, temperature=0.2)
+    if result is None:
+        raise RuntimeError("generation backend returned no result")
+    if not result.text.strip():
+        reason = result.diagnostics.get("reason") if result.diagnostics else None
+        raise RuntimeError(f"generation returned empty text ({reason or 'unknown reason'})")
     return result.text.strip(), result.provider or "", result.model or ""
 
 

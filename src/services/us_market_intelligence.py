@@ -7,6 +7,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -98,6 +99,7 @@ class QuotePoint:
     validation_status: str = "unverified"
     validation_reasons: tuple[str, ...] = ()
     previous_close: Optional[float] = None
+    horizon_returns: dict[str, Optional[float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -251,6 +253,34 @@ def _latest_close(frame: pd.DataFrame) -> tuple[Optional[float], Optional[pd.Tim
     return _clean_float(closes.iloc[-1]), timestamp
 
 
+HORIZON_TRADING_DAYS: dict[str, int] = {
+    "1d": 1,
+    "5d": 5,
+    "1m": 21,
+    "3m": 63,
+    "6m": 126,
+}
+
+
+def _horizon_returns(frame: pd.DataFrame, latest_price: Optional[float]) -> dict[str, Optional[float]]:
+    returns: dict[str, Optional[float]] = {key: None for key in HORIZON_TRADING_DAYS}
+    if frame.empty or "Close" not in frame or latest_price is None:
+        return returns
+    closes = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+    if closes.empty:
+        return returns
+    for label, sessions in HORIZON_TRADING_DAYS.items():
+        # Daily history normally ends at the previous completed session while
+        # latest_price is intraday/after-hours, so 1d uses the last daily close.
+        index = -sessions
+        if len(closes) < sessions:
+            continue
+        baseline = _clean_float(closes.iloc[index])
+        if baseline not in (None, 0):
+            returns[label] = round((latest_price - baseline) / baseline * 100, 2)
+    return returns
+
+
 def _previous_regular_close(frame: pd.DataFrame, now: datetime) -> Optional[float]:
     if frame.empty or "Close" not in frame:
         return None
@@ -304,7 +334,7 @@ def fetch_us_market_snapshot(
     try:
         daily = download(
             symbols,
-            period="10d",
+            period="1y",
             interval="1d",
             group_by="ticker",
             auto_adjust=True,
@@ -319,11 +349,21 @@ def fetch_us_market_snapshot(
     quotes: dict[str, QuotePoint] = {}
     now_utc = current.astimezone(UTC)
     current_session = market_session(current)
-    ttl_seconds = 15 * 60 if current_session in {"premarket", "intraday", "postmarket"} else 24 * 60 * 60
+    if current_session in {"premarket", "intraday"}:
+        ttl_seconds = 15 * 60
+    elif current_session == "postmarket":
+        # After extended-hours data stops updating, the latest completed session
+        # remains valid until the next premarket. Do not flag the whole market stale.
+        ttl_seconds = 18 * 60 * 60
+    else:
+        ttl_seconds = 36 * 60 * 60
     retrieved_at = now_utc.isoformat()
     for symbol in symbols:
-        price, timestamp = _latest_close(_ticker_frame(intraday, symbol, len(symbols)))
-        previous_close = _previous_regular_close(_ticker_frame(daily, symbol, len(symbols)), current)
+        intraday_frame = _ticker_frame(intraday, symbol, len(symbols))
+        daily_frame = _ticker_frame(daily, symbol, len(symbols))
+        price, timestamp = _latest_close(intraday_frame)
+        previous_close = _previous_regular_close(daily_frame, current)
+        horizon_returns = _horizon_returns(daily_frame, price)
         change_pct = None
         if price is not None and previous_close not in (None, 0):
             change_pct = round((price - previous_close) / previous_close * 100, 2)
@@ -367,6 +407,7 @@ def fetch_us_market_snapshot(
                 validation_status=validation_status,
                 validation_reasons=tuple(validation_reasons),
                 previous_close=previous_close,
+                horizon_returns=horizon_returns,
             )
 
     missing = [symbol for symbol in symbols if symbol not in quotes]
@@ -449,6 +490,31 @@ def validate_news_item(
     )
 
 
+def _canonical_news_title(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _clean_news_result(result: Any, category: str, retrieved_at: str) -> Optional[NewsItem]:
+    url = (result.url or "").strip()
+    title = re.sub(r"\s+", " ", (result.title or "")).strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not title:
+        return None
+    domain = (parsed.hostname or "").lower().removeprefix("www.")
+    # Reject malformed results where provider text has been appended to the URL.
+    if url.endswith(tuple(str(index) for index in range(10))) and re.search(r"\)\d$", url):
+        return None
+    return NewsItem(
+        category=category,
+        title=title,
+        url=url,
+        source=domain or (result.source or "").strip(),
+        published_date=result.published_date,
+        snippet=re.sub(r"\s+", " ", (result.snippet or "")).strip()[:400],
+        retrieved_at=retrieved_at,
+    )
+
+
 def collect_us_news(
     config: Any,
     *,
@@ -467,6 +533,7 @@ def collect_us_news(
     provider = BraveSearchProvider(keys)
     items: list[NewsItem] = []
     seen_urls: set[str] = set()
+    seen_titles: set[str] = set()
     for category, query in NEWS_QUERIES:
         try:
             response = provider.search(
@@ -482,19 +549,16 @@ def collect_us_news(
         if not response.success:
             warnings.append(f"{category}新闻检索失败：{response.error_message or 'unknown error'}")
             continue
+        retrieved_at = (now or datetime.now(tz=UTC)).astimezone(UTC).isoformat()
         for result in response.results:
-            if not result.url or result.url in seen_urls:
+            item = _clean_news_result(result, category, retrieved_at)
+            if item is None:
                 continue
-            seen_urls.add(result.url)
-            item = NewsItem(
-                category=category,
-                title=result.title.strip(),
-                url=result.url.strip(),
-                source=result.source.strip(),
-                published_date=result.published_date,
-                snippet=result.snippet.strip()[:400],
-                retrieved_at=(now or datetime.now(tz=UTC)).astimezone(UTC).isoformat(),
-            )
+            title_key = _canonical_news_title(item.title)
+            if item.url in seen_urls or title_key in seen_titles:
+                continue
+            seen_urls.add(item.url)
+            seen_titles.add(title_key)
             items.append(item)
     if validate_links and items:
         with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
@@ -523,6 +587,7 @@ def build_structured_snapshot(data: USMarketIntelligenceData) -> USMarketIntelli
                 price=quote.price,
                 change_pct=quote.change_pct,
                 previous_close=quote.previous_close,
+                horizon_returns=dict(quote.horizon_returns),
                 stale_seconds=stale_seconds,
                 provenance=QuoteProvenance(
                     provider=quote.source,
@@ -697,16 +762,21 @@ def build_prompt(data: USMarketIntelligenceData, snapshot: Optional[USMarketInte
     """Build a bounded, evidence-first Chinese synthesis prompt."""
     quote_lines = []
     for quote in data.quotes.values():
+        horizons = ",".join(
+            f"{label}={_fmt_pct(value)}" for label, value in quote.horizon_returns.items()
+        )
         quote_lines.append(
             f"- {quote.symbol} {quote.name}: price={_fmt_number(quote.price)}, "
-            f"change={_fmt_pct(quote.change_pct)}, as_of={quote.as_of or 'unknown'}, "
+            f"change={_fmt_pct(quote.change_pct)}, horizons=[{horizons}], "
+            f"as_of={quote.as_of or 'unknown'}, "
             f"stale_minutes={quote.stale_minutes if quote.stale_minutes is not None else 'unknown'}"
         )
     news_lines = [
         f"- [{item.category}] {item.title} | {item.source} | {item.published_date or '时间未知'} | "
-        f"validation={item.validation_status} | {item.url}"
-        for item in data.news[:20]
-    ]
+        f"validation={item.validation_status} | {item.url} | snippet={item.snippet}"
+        for item in data.news
+        if item.validation_status == "valid"
+    ][:12]
     comparison_lines: list[str] = []
     anomaly_lines: list[str] = []
     if snapshot is not None:
@@ -736,8 +806,10 @@ def build_prompt(data: USMarketIntelligenceData, snapshot: Optional[USMarketInte
 5. 行业轮动以 11 个行业 ETF 相对 SPY 的当日表现、上一小时变化和排名变化为依据。
 6. 数值异常仅采用下方规则引擎已触发的项目，禁止自行捏造阈值或异常。
 7. 给出未来 1-3 小时观察清单和可验证触发条件，不给确定性收益承诺。
-8. 使用固定章节：市场总结、关键变化、市场状态与风险偏好、行业轮动、异常与潜在驱动、需要监控的事件、触发条件。
-9. 新闻引用使用 Markdown 链接；不要重复原始数据表，也不要添加免责声明页脚。
+8. 使用固定章节并按此顺序：经济周期定位、金融故事主线与主要矛盾、多周期行业轮动、跨资产验证、异动与潜力股票、逐条新闻评价、监控事件与触发条件。
+9. 多周期轮动必须分别解释 1日、5日、1个月、3个月、6个月；未来只给条件情景，不得把历史收益外推成确定预测。
+10. 每条合格新闻都要给：核心结论、可能影响、进入哪条主线、证据等级、还需什么验证。无效或未校验新闻不进入正文。
+11. 新闻引用使用 Markdown 链接；不要重复原始数据表，也不要添加免责声明页脚。
 
 生成时间（纽约）：{data.generated_at.astimezone(NEW_YORK).isoformat()}
 市场阶段：{data.session_label}
@@ -771,6 +843,160 @@ def _fmt_pct(value: Optional[float]) -> str:
     return f"{value:+.2f}%"
 
 
+def _market_regime_summary(data: USMarketIntelligenceData) -> list[str]:
+    spy = data.quotes.get("SPY")
+    qqq = data.quotes.get("QQQ")
+    iwm = data.quotes.get("IWM")
+    vix = data.quotes.get("^VIX")
+    tnx = data.quotes.get("^TNX")
+    dollar = data.quotes.get("DX-Y.NYB")
+    lines: list[str] = []
+    if spy and vix and spy.change_pct is not None and vix.change_pct is not None:
+        if spy.change_pct < 0 and vix.change_pct > 5:
+            lines.append("- **周期状态：风险收缩/去杠杆阶段。** 股指下跌且 VIX 明显上升，短线以防守和流动性管理优先。")
+        elif spy.change_pct > 0 and vix.change_pct < 0:
+            lines.append("- **周期状态：风险扩张阶段。** 股指上涨且波动率回落，风险资产内部轮动更值得关注。")
+        else:
+            lines.append("- **周期状态：分化/过渡阶段。** 股指与波动率信号未形成一致方向，需要等待确认。")
+    else:
+        lines.append("- **周期状态：数据不足。** 缺少 SPY 或 VIX 的可比数据。")
+    if qqq and iwm and qqq.change_pct is not None and iwm.change_pct is not None:
+        style = "大盘成长相对占优" if qqq.change_pct > iwm.change_pct else "小盘相对占优"
+        lines.append(f"- **风格主线：{style}。** QQQ 与 IWM 当日相对差为 {qqq.change_pct - iwm.change_pct:+.2f} 个百分点。")
+    if tnx and dollar and tnx.change_pct is not None and dollar.change_pct is not None:
+        lines.append(
+            f"- **主要矛盾：增长/估值与金融条件的博弈。** 10年期收益率 {tnx.change_pct:+.2f}%，"
+            f"美元 {dollar.change_pct:+.2f}%；需判断风险变化来自增长预期还是流动性收紧。"
+        )
+    return lines
+
+
+def _sector_rotation_table(data: USMarketIntelligenceData) -> str:
+    spy = data.quotes.get("SPY")
+    horizons = ("1d", "5d", "1m", "3m", "6m")
+    headers = ["行业", *horizons, "当前判断"]
+    lines = ["| " + " | ".join(headers) + " |", "|---|---:|---:|---:|---:|---:|---|"]
+    for quote in data.sectors:
+        relatives: list[Optional[float]] = []
+        for horizon in horizons:
+            sector_return = quote.horizon_returns.get(horizon)
+            spy_return = spy.horizon_returns.get(horizon) if spy else None
+            relatives.append(
+                round(sector_return - spy_return, 2)
+                if sector_return is not None and spy_return is not None
+                else None
+            )
+        available = [value for value in relatives if value is not None]
+        positive = sum(value > 0 for value in available)
+        if len(available) >= 3 and positive >= max(2, len(available) - 1):
+            regime = "多周期领先"
+        elif len(available) >= 3 and positive <= 1:
+            regime = "多周期落后"
+        elif available and available[0] > 0:
+            regime = "短线改善/待确认"
+        else:
+            regime = "轮动分化"
+        values = [_fmt_pct(value) for value in relatives]
+        lines.append(f"| {quote.name} ({quote.symbol}) | " + " | ".join([*values, regime]) + " |")
+    return "\n".join(lines)
+
+
+def _sector_horizon_outlook(data: USMarketIntelligenceData) -> str:
+    spy = data.quotes.get("SPY")
+    if spy is None:
+        return "- 缺少 SPY 基准，无法形成分周期轮动情景。"
+    horizon_specs = (
+        ("未来1个交易日", "1d", "5d"),
+        ("未来1个月", "1m", "5d"),
+        ("未来3个月", "3m", "1m"),
+        ("未来6个月", "6m", "3m"),
+    )
+    lines = []
+    for label, primary, confirm in horizon_specs:
+        ranked = []
+        for quote in data.sectors:
+            primary_value = quote.horizon_returns.get(primary)
+            confirm_value = quote.horizon_returns.get(confirm)
+            spy_primary = spy.horizon_returns.get(primary)
+            spy_confirm = spy.horizon_returns.get(confirm)
+            if primary_value is None or spy_primary is None:
+                continue
+            primary_relative = primary_value - spy_primary
+            confirm_relative = (
+                confirm_value - spy_confirm
+                if confirm_value is not None and spy_confirm is not None
+                else None
+            )
+            ranked.append((primary_relative, confirm_relative, quote.symbol))
+        ranked.sort(reverse=True)
+        if not ranked:
+            lines.append(f"- **{label}：数据不足。** 尚无足够历史窗口。")
+            continue
+        leaders = ", ".join(item[2] for item in ranked[:3])
+        confirmations = [item for item in ranked[:3] if item[1] is not None and item[1] > 0]
+        if len(confirmations) >= 2:
+            view = f"当前条件下 {leaders} 具备相对延续基础"
+        else:
+            view = f"{leaders} 仅是当前窗口领先，持续性尚未得到相邻周期确认"
+        lines.append(
+            f"- **{label}：{view}。** 若领先组合的相对收益转负或排名跌出前五，则该情景失效。"
+        )
+    return "\n".join(lines)
+
+
+def _watchlist_opportunity_table(data: USMarketIntelligenceData) -> str:
+    spy = data.quotes.get("SPY")
+    rows = []
+    for quote in data.watchlist:
+        relative_1d = None
+        relative_1m = None
+        if spy:
+            if quote.change_pct is not None and spy.change_pct is not None:
+                relative_1d = quote.change_pct - spy.change_pct
+            stock_1m = quote.horizon_returns.get("1m")
+            spy_1m = spy.horizon_returns.get("1m")
+            if stock_1m is not None and spy_1m is not None:
+                relative_1m = stock_1m - spy_1m
+        score = sum(value or 0 for value in (relative_1d, relative_1m))
+        rows.append((score, quote, relative_1d, relative_1m))
+    rows.sort(key=lambda item: item[0], reverse=True)
+    lines = ["| 标的 | 当日相对SPY | 1月相对SPY | 观察结论 |", "|---|---:|---:|---|"]
+    for _score, quote, relative_1d, relative_1m in rows[:8]:
+        if relative_1d is not None and relative_1m is not None and relative_1d > 0 and relative_1m > 0:
+            conclusion = "短中期相对强势，观察回撤承接"
+        elif relative_1d is not None and relative_1d > 0:
+            conclusion = "当日抗跌/走强，等待中期确认"
+        else:
+            conclusion = "弱于基准，暂不作为优先方向"
+        lines.append(
+            f"| {quote.symbol} | {_fmt_pct(relative_1d)} | {_fmt_pct(relative_1m)} | {conclusion} |"
+        )
+    return "\n".join(lines) if rows else "暂无观察名单数据。"
+
+
+def _news_assessment(item: NewsItem) -> str:
+    text = f"{item.title} {item.snippet}".lower()
+    if any(term in text for term in ("fed", "yield", "inflation", "cpi", "jobs", "payroll")):
+        theme = "货币政策与金融条件"
+        impact = "可能影响利率路径、估值折现率与成长/价值风格"
+    elif any(term in text for term in ("earnings", "revenue", "eps", "guidance")):
+        theme = "企业盈利与预期修正"
+        impact = "可能影响相关公司及行业盈利预期"
+    elif any(term in text for term in ("oil", "energy", "opec")):
+        theme = "能源与通胀链"
+        impact = "可能影响能源板块、通胀预期和消费成本"
+    else:
+        theme = "市场风险偏好"
+        impact = "可作为情绪或主线线索，但尚未确认价格因果"
+    validation = "链接与发布时间已校验" if item.validation_status == "valid" else "证据未完全校验"
+    return (
+        f"- **{item.title}**（{item.source}）\n"
+        f"  - 结论：归入“{theme}”主线；{impact}。\n"
+        f"  - 证据等级：未经验证假设；{validation}，需以原始公告或权威来源复核。\n"
+        f"  - 链接：{item.url}"
+    )
+
+
 def _quote_table(quotes: Iterable[QuotePoint], *, relative_to: Optional[float] = None) -> str:
     lines = ["| 标的 | 最新 | 日变动 | 相对SPY |", "|---|---:|---:|---:|"]
     count = 0
@@ -787,23 +1013,37 @@ def _quote_table(quotes: Iterable[QuotePoint], *, relative_to: Optional[float] =
 
 
 def deterministic_report(data: USMarketIntelligenceData) -> str:
-    """Produce a useful non-duplicating body when the LLM is unavailable."""
+    """Produce strategy-oriented analysis even when optional LLM synthesis fails."""
     macro = [data.quotes[symbol] for symbol in MACRO_SYMBOLS if symbol in data.quotes]
-    news_lines = [
-        f"- [{item.category}] [{item.title}]({item.url})（{item.source}）" for item in data.news[:12]
+    valid_news = [item for item in data.news if item.validation_status == "valid"]
+    sections = [
+        "## 一、经济周期与市场状态",
+        "\n".join(_market_regime_summary(data)),
+        "## 二、金融故事主线与主要矛盾",
+        "- 当前主线由风险偏好、利率/美元金融条件、盈利预期和行业相对强弱共同决定。",
+        "- 主要矛盾应通过股指与 VIX、收益率与成长股、美元与商品、周期与防守板块是否互相验证来判断。",
+        "- 下述新闻仅作为潜在驱动线索，不直接认定为价格变化原因。",
+        "## 三、多周期行业轮动（相对 SPY）",
+        _sector_rotation_table(data),
+        "- 解释：正值代表该周期跑赢 SPY；负值代表跑输。短期与中期同向才视为较稳定轮动。",
+        "- 未来情景：多周期领先若继续扩大，主线延续概率提高；若1日/5日率先转负，视为轮动衰减信号。",
+        "### 分周期条件展望",
+        _sector_horizon_outlook(data),
+        "## 四、跨资产验证",
+        _quote_table(macro),
+        "## 五、值得关注的相对强势股票",
+        _watchlist_opportunity_table(data),
+        "## 六、新闻评价与主线映射",
+        "\n".join(_news_assessment(item) for item in valid_news[:10])
+        if valid_news
+        else "暂无通过链接与发布时间校验的新闻，不对驱动因素作确认。",
+        "## 七、监控事件与触发条件",
+        "- 风险恶化：SPY/QQQ 继续下跌且 VIX 维持高位或进一步上行。",
+        "- 风格切换：行业 ETF 的 1日和5日相对强弱同步反转，并延续到1个月窗口。",
+        "- 金融条件收紧：10年期收益率与美元同步上行，同时成长板块继续跑输。",
+        "- 主线确认：新闻线索获得官方公告/经济数据原文验证，并与价格、成交和行业扩散相互印证。",
     ]
-    return "\n\n".join(
-        [
-            "## 跨资产主线",
-            _quote_table(macro),
-            "## 大盘股异动",
-            _quote_table(data.watchlist[:8]),
-            "## 热点、经济与财报线索",
-            "\n".join(news_lines) if news_lines else "暂无可用新闻；不对热点和催化作推断。",
-            "## 未来1-3小时检查项",
-            "LLM 暂不可用。本次仅展示可核验行情与新闻标题；请复核原始链接，并关注指数与领先板块是否延续。",
-        ]
-    )
+    return "\n\n".join(sections)
 
 
 def compose_report(
@@ -855,23 +1095,21 @@ def compose_report(
 纽约时间：{data.generated_at.astimezone(NEW_YORK):%Y-%m-%d %H:%M}
 行情最新时间：{newest}
 
-## 核心市场
+{analysis_body.strip()}
+
+## 数据附录：核心市场
 
 {_quote_table(market)}
 
-## 行业轮动速览
+## 数据附录：当日行业强弱
 
 {_quote_table(data.sectors, relative_to=spy_change)}
 
-## 关键变化
+## 数据附录：快照变化与规则异常
 
 {chr(10).join(change_lines)}
 
-## 规则异常
-
 {chr(10).join(anomaly_lines)}
-
-{analysis_body.strip()}
 
 ## 数据质量
 

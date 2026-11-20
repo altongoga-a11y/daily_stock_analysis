@@ -39,6 +39,7 @@ class QuoteFact(_StrictModel):
     price: Optional[float] = None
     change_pct: Optional[float] = None
     previous_close: Optional[float] = None
+    horizon_returns: Dict[str, Optional[float]] = Field(default_factory=dict)
     stale_seconds: Optional[int] = Field(default=None, ge=0)
     fact_kind: Literal["confirmed_fact"] = "confirmed_fact"
     provenance: QuoteProvenance

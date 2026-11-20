@@ -68,23 +68,32 @@ def run_intelligence_engine(
     analysis_body = ""
     provider = None
     model = None
+    generation_error = None
     if generate is not None:
         try:
             analysis_body, provider, model = generate(build_prompt(data, snapshot))
+            if not analysis_body:
+                generation_error = "模型返回空内容；请检查模型名称、权限、余额或 API 配额"
         except Exception as exc:
-            data.warnings.append(f"LLM 生成失败：{type(exc).__name__}")
+            generation_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+    if generation_error:
+        data.warnings.append(f"LLM 生成失败：{generation_error}")
+    strategy_body = deterministic_report(data)
     if analysis_body:
         snapshot.intelligence.status = "generated"
         snapshot.intelligence.narrative_markdown = analysis_body
         snapshot.intelligence.provider = provider or None
         snapshot.intelligence.model = model or None
+        report_body = f"{strategy_body}\n\n## 八、AI 深度研判\n\n{analysis_body}"
     else:
-        analysis_body = deterministic_report(data)
         snapshot.intelligence.status = "fallback"
-        snapshot.intelligence.narrative_markdown = analysis_body
-        snapshot.intelligence.warnings.append("未生成 AI 叙事，不对新闻和价格变化建立因果关系")
+        snapshot.intelligence.narrative_markdown = strategy_body
+        snapshot.intelligence.warnings.append(
+            f"未生成 AI 叙事：{generation_error or '未配置生成器'}；已使用确定性策略报告"
+        )
+        report_body = strategy_body
 
-    report = compose_report(data, analysis_body, snapshot)
+    report = compose_report(data, report_body, snapshot)
     snapshot.report_markdown = report
     snapshot.warnings = list(dict.fromkeys([*snapshot.warnings, *data.warnings]))
     history_path = history.save(snapshot) if history is not None else None
