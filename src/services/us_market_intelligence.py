@@ -262,16 +262,29 @@ HORIZON_TRADING_DAYS: dict[str, int] = {
 }
 
 
-def _horizon_returns(frame: pd.DataFrame, latest_price: Optional[float]) -> dict[str, Optional[float]]:
+def _horizon_returns(
+    frame: pd.DataFrame,
+    latest_price: Optional[float],
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Optional[float]]:
     returns: dict[str, Optional[float]] = {key: None for key in HORIZON_TRADING_DAYS}
     if frame.empty or "Close" not in frame or latest_price is None:
         return returns
     closes = pd.to_numeric(frame["Close"], errors="coerce").dropna()
     if closes.empty:
         return returns
+    current = (now or datetime.now(tz=NEW_YORK)).astimezone(NEW_YORK)
+    index_dates = pd.DatetimeIndex(closes.index)
+    if index_dates.tz is not None:
+        index_dates = index_dates.tz_convert(NEW_YORK).tz_localize(None)
+    # yfinance may include today's partial daily bar. Remove it before choosing
+    # completed-session baselines so intraday and daily prices do not share the
+    # same timestamp and collapse 1d relative returns toward zero.
+    completed = closes[index_dates.date < current.date()]
+    if not completed.empty:
+        closes = completed
     for label, sessions in HORIZON_TRADING_DAYS.items():
-        # Daily history normally ends at the previous completed session while
-        # latest_price is intraday/after-hours, so 1d uses the last daily close.
         index = -sessions
         if len(closes) < sessions:
             continue
@@ -363,7 +376,7 @@ def fetch_us_market_snapshot(
         daily_frame = _ticker_frame(daily, symbol, len(symbols))
         price, timestamp = _latest_close(intraday_frame)
         previous_close = _previous_regular_close(daily_frame, current)
-        horizon_returns = _horizon_returns(daily_frame, price)
+        horizon_returns = _horizon_returns(daily_frame, price, now=current)
         change_pct = None
         if price is not None and previous_close not in (None, 0):
             change_pct = round((price - previous_close) / previous_close * 100, 2)
@@ -428,6 +441,24 @@ def _parse_published_at(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(UTC)
 
 
+_PUBLISHED_META_PATTERNS = (
+    re.compile(r'<meta[^>]+(?:property|name)=["\'](?:article:published_time|datePublished|date|pubdate)["\'][^>]+content=["\']([^"\']+)', re.I),
+    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:article:published_time|datePublished|date|pubdate)["\']', re.I),
+    re.compile(r'"datePublished"\s*:\s*"([^"]+)"', re.I),
+)
+
+
+def _extract_published_at_from_html(html: str) -> Optional[datetime]:
+    for pattern in _PUBLISHED_META_PATTERNS:
+        match = pattern.search(html or "")
+        if not match:
+            continue
+        parsed = _parse_published_at(match.group(1))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def validate_news_item(
     item: NewsItem,
     *,
@@ -454,15 +485,17 @@ def validate_news_item(
         requester = request or requests.head
         request_kwargs = {
             "allow_redirects": True,
-            "timeout": 5,
+            "timeout": 3,
             "headers": {"User-Agent": "daily-stock-analysis/US-market-intelligence"},
         }
         try:
             response = requester(item.url, **request_kwargs)
             status_code = int(response.status_code)
-            if request is None and status_code in {403, 405}:
-                response = requests.get(item.url, stream=True, **request_kwargs)
+            if request is None and (status_code in {403, 405} or published is None):
+                response = requests.get(item.url, **request_kwargs)
                 status_code = int(response.status_code)
+                if status_code < 400 and published is None:
+                    published = _extract_published_at_from_html(response.text[:500000])
                 response.close()
             if status_code >= 400:
                 reasons.append(f"http_status_{status_code}")
@@ -471,6 +504,12 @@ def validate_news_item(
         except Exception as exc:
             reasons.append(f"url_check_failed_{type(exc).__name__}")
 
+    if published is not None:
+        reasons = [reason for reason in reasons if reason != "published_at_missing_or_invalid"]
+        if published > current + timedelta(hours=2) and "published_at_in_future" not in reasons:
+            reasons.append("published_at_in_future")
+        elif published < current - timedelta(days=3) and "published_at_expired" not in reasons:
+            reasons.append("published_at_expired")
     status = "valid" if not reasons else "unverified"
     if "invalid_url" in reasons or any(reason.startswith("http_status_") for reason in reasons):
         status = "invalid"
@@ -806,7 +845,7 @@ def build_prompt(data: USMarketIntelligenceData, snapshot: Optional[USMarketInte
 5. 行业轮动以 11 个行业 ETF 相对 SPY 的当日表现、上一小时变化和排名变化为依据。
 6. 数值异常仅采用下方规则引擎已触发的项目，禁止自行捏造阈值或异常。
 7. 给出未来 1-3 小时观察清单和可验证触发条件，不给确定性收益承诺。
-8. 使用固定章节并按此顺序：经济周期定位、金融故事主线与主要矛盾、多周期行业轮动、跨资产验证、异动与潜力股票、逐条新闻评价、监控事件与触发条件。
+8. 使用固定章节并按此顺序：宏观经济周期证据、市场风险阶段、金融故事主线与主要矛盾、多周期行业轮动、跨资产验证、异动与潜力股票、逐条新闻评价、监控事件与触发条件。没有可靠宏观数据时必须写“宏观周期证据不足”，禁止用单日价格代替经济周期。
 9. 多周期轮动必须分别解释 1日、5日、1个月、3个月、6个月；未来只给条件情景，不得把历史收益外推成确定预测。
 10. 每条合格新闻都要给：核心结论、可能影响、进入哪条主线、证据等级、还需什么验证。无效或未校验新闻不进入正文。
 11. 新闻引用使用 Markdown 链接；不要重复原始数据表，也不要添加免责声明页脚。
@@ -853,13 +892,13 @@ def _market_regime_summary(data: USMarketIntelligenceData) -> list[str]:
     lines: list[str] = []
     if spy and vix and spy.change_pct is not None and vix.change_pct is not None:
         if spy.change_pct < 0 and vix.change_pct > 5:
-            lines.append("- **周期状态：风险收缩/去杠杆阶段。** 股指下跌且 VIX 明显上升，短线以防守和流动性管理优先。")
+            lines.append("- **市场风险阶段：风险收缩/去杠杆。** 股指下跌且 VIX 明显上升，短线以防守和流动性管理优先。")
         elif spy.change_pct > 0 and vix.change_pct < 0:
-            lines.append("- **周期状态：风险扩张阶段。** 股指上涨且波动率回落，风险资产内部轮动更值得关注。")
+            lines.append("- **市场风险阶段：风险扩张。** 股指上涨且波动率回落，风险资产内部轮动更值得关注。")
         else:
-            lines.append("- **周期状态：分化/过渡阶段。** 股指与波动率信号未形成一致方向，需要等待确认。")
+            lines.append("- **市场风险阶段：分化/过渡。** 股指与波动率信号未形成一致方向，需要等待确认。")
     else:
-        lines.append("- **周期状态：数据不足。** 缺少 SPY 或 VIX 的可比数据。")
+        lines.append("- **市场风险阶段：数据不足。** 缺少 SPY 或 VIX 的可比数据。")
     if qqq and iwm and qqq.change_pct is not None and iwm.change_pct is not None:
         style = "大盘成长相对占优" if qqq.change_pct > iwm.change_pct else "小盘相对占优"
         lines.append(f"- **风格主线：{style}。** QQQ 与 IWM 当日相对差为 {qqq.change_pct - iwm.change_pct:+.2f} 个百分点。")
@@ -1016,8 +1055,19 @@ def deterministic_report(data: USMarketIntelligenceData) -> str:
     """Produce strategy-oriented analysis even when optional LLM synthesis fails."""
     macro = [data.quotes[symbol] for symbol in MACRO_SYMBOLS if symbol in data.quotes]
     valid_news = [item for item in data.news if item.validation_status == "valid"]
+    macro_evidence = [
+        item
+        for item in valid_news
+        if any(term in f"{item.title} {item.snippet}".lower() for term in ("cpi", "inflation", "payroll", "gdp", "fed", "jobs"))
+    ]
+    macro_cycle_line = (
+        f"- **宏观经济周期：有 {len(macro_evidence)} 条已校验宏观证据，需结合其原始数据判断增长与通胀方向。**"
+        if macro_evidence
+        else "- **宏观经济周期：证据不足，暂不做扩张/放缓/衰退定性。** 当前报告只判断市场风险阶段。"
+    )
     sections = [
-        "## 一、经济周期与市场状态",
+        "## 一、宏观周期与市场风险阶段",
+        macro_cycle_line,
         "\n".join(_market_regime_summary(data)),
         "## 二、金融故事主线与主要矛盾",
         "- 当前主线由风险偏好、利率/美元金融条件、盈利预期和行业相对强弱共同决定。",

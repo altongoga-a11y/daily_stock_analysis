@@ -93,6 +93,13 @@ class _Response:
         self.status_code = status_code
 
 
+def test_news_page_metadata_recovers_missing_publication_time():
+    from src.services.us_market_intelligence import _extract_published_at_from_html
+
+    html = '<script type="application/ld+json">{"datePublished":"2026-11-19T16:00:00Z"}</script>'
+    assert _extract_published_at_from_html(html).isoformat() == "2026-11-19T16:00:00+00:00"
+
+
 def test_news_validation_checks_url_reachability_and_publication_time():
     now = datetime(2026, 11, 19, 17, 0, tzinfo=UTC)
     item = NewsItem(
@@ -262,7 +269,9 @@ def test_engine_emits_same_snapshot_id_in_markdown_json_contract_and_history(tmp
     assert len([item for item in result.snapshot.quotes if item.symbol in SECTOR_SYMBOLS]) == 11
     assert all(item.provenance.provider == "Yahoo Finance" for item in result.snapshot.quotes)
     assert result.snapshot.intelligence.status == "generated"
-    assert result.report.index("经济周期") < result.report.index("数据附录：核心市场")
+    assert result.report.index("宏观周期") < result.report.index("数据附录：核心市场")
+    assert "宏观经济周期：证据不足" in result.report
+    assert "市场风险阶段" in result.report
     assert "多周期行业轮动" in result.report
     assert "未来1个交易日" in result.report
     assert "未来1个月" in result.report

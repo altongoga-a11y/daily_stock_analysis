@@ -32,7 +32,7 @@
 US_INTELLIGENCE_WATCHLIST=AAPL,MSFT,NVDA,GOOGL,AMZN,META,JPM,XOM,LLY,WMT,CAT,NEE
 ```
 
-未设置时会读取既有 `STOCK_LIST`。工作流对官方 OpenAI Key 默认使用 `gpt-4o-mini`；如需其他模型，可通过 Repository Variable `OPENAI_MODEL` 覆盖。API Key 不应放入 Repository Variables。模型不可用、权限不足、余额或配额问题会记录在报告数据边界和 JSON warnings 中，确定性策略报告仍会生成。
+未设置时会读取既有 `STOCK_LIST`。工作流对官方 OpenAI Key 默认使用 `gpt-4o-mini`；如需其他模型，可通过 Repository Variable `OPENAI_MODEL` 覆盖。API Key 不应放入 Repository Variables。系统先使用项目 LiteLLM 路由，失败时再使用官方 OpenAI SDK 直连；两条路径的模型不可用、权限、余额或配额错误会记录在报告数据边界和 JSON warnings 中，确定性策略报告仍会生成。
 
 ## 调度
 
@@ -72,7 +72,7 @@ python scripts/us_market_intelligence.py --no-send
 
 - 行情来自 Yahoo Finance 的最新可用数据，可能延迟、缺字段或受限流影响，不是交易所直连实时行情。盘中默认 15 分钟 TTL；盘后已完成交易时段的数据按隔夜有效处理，避免把正常收盘数据误报为陈旧。
 - 行业轮动基于 11 个行业 ETF 相对 SPY 的当日涨跌表现，是价格强弱代理，不等于完整资金流统计。
-- Brave Search 用于发现新闻线索。每条结果会检查 URL 格式、HTTP 可达性和发布时间，但这些检查不能替代 SEC 文件、公司投资者关系公告、BLS、BEA、Federal Reserve 等原始来源。
+- Brave Search 用于发现新闻线索。每条结果会检查 URL 格式、HTTP 可达性和发布时间；搜索结果缺时间时会尝试从页面 `article:published_time` / `datePublished` 元数据恢复，但这些检查不能替代 SEC 文件、公司投资者关系公告、BLS、BEA、Federal Reserve 等原始来源。
 - 新闻链接缺时间、不可达、过期或时间在未来时会降级对应证据，不会阻断整份报告。
 - 任一行情、新闻、历史恢复或 LLM 环节失败时，脚本保留其他可用数据；LLM 失败会退回确定性 Markdown 与 JSON 输出。
 

@@ -71,16 +71,43 @@ def _sample_config():
 
 
 def _generate_analysis(config, prompt: str) -> tuple[str, str, str]:
+    """Use repository routing first, then a direct official OpenAI fallback."""
     from src.analyzer import GeminiAnalyzer
 
-    analyzer = GeminiAnalyzer(config=config)
-    result = analyzer.generate_text_with_metadata(prompt, max_tokens=3200, temperature=0.2)
-    if result is None:
-        raise RuntimeError("generation backend returned no result")
-    if not result.text.strip():
-        reason = result.diagnostics.get("reason") if result.diagnostics else None
-        raise RuntimeError(f"generation returned empty text ({reason or 'unknown reason'})")
-    return result.text.strip(), result.provider or "", result.model or ""
+    routed_error = ""
+    try:
+        analyzer = GeminiAnalyzer(config=config)
+        result = analyzer.generate_text_with_metadata(prompt, max_tokens=3200, temperature=0.2)
+        if result is not None and result.text.strip():
+            return result.text.strip(), result.provider or "", result.model or ""
+        reason = result.diagnostics.get("reason") if result and result.diagnostics else None
+        routed_error = f"LiteLLM empty response ({reason or 'unknown reason'})"
+    except Exception as exc:
+        routed_error = f"LiteLLM {type(exc).__name__}: {str(exc)[:240]}"
+
+    api_key = (getattr(config, "openai_api_key", None) or "").strip()
+    base_url = (getattr(config, "openai_base_url", None) or "").strip() or None
+    model = (getattr(config, "openai_model", None) or "gpt-4o-mini").strip()
+    if not api_key:
+        raise RuntimeError(f"{routed_error}; direct OpenAI fallback unavailable: missing OPENAI_API_KEY")
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=3200,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if not text:
+            raise RuntimeError("OpenAI returned empty content")
+        return text, "openai-direct", model
+    except Exception as exc:
+        raise RuntimeError(
+            f"{routed_error}; direct OpenAI {type(exc).__name__}: {str(exc)[:300]}"
+        ) from exc
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
