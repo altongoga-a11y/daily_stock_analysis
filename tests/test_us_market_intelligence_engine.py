@@ -261,6 +261,7 @@ def test_engine_emits_same_snapshot_id_in_markdown_json_contract_and_history(tmp
         generate=lambda _prompt: ("【数据推断】风险偏好温和。", "test", "model"),
         history=USMarketIntelligenceHistory(tmp_path),
         validate_news_links=False,
+        collect_authoritative_evidence=False,
     )
     payload = result.snapshot.to_json_dict()
     assert result.snapshot.snapshot_id in result.report

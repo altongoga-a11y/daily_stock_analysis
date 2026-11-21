@@ -26,6 +26,12 @@
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
+可选权威证据配置：
+
+- `BLS_REGISTRATION_KEY` Secret：不配置时使用 BLS 公共未注册额度。
+- `FXMACRODATA_API_KEY` Secret：不配置时仅使用其公开 USD 能力。
+- `SEC_USER_AGENT` Repository Variable：格式应包含应用名称和联系邮箱，例如 `daily-stock-analysis contact@example.com`。未配置时 SEC 请求明确禁用，不会伪造身份。
+
 可选 Repository Variable：
 
 ```text

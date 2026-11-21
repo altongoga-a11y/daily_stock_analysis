@@ -45,6 +45,58 @@ class QuoteFact(_StrictModel):
     provenance: QuoteProvenance
 
 
+class MacroFact(_StrictModel):
+    evidence_id: str
+    series_id: str
+    name: str
+    value: float
+    unit: str
+    period: str
+    frequency: str
+    seasonal_adjustment: str
+    provider: str
+    source_url: str
+    retrieved_at: str
+    validation_status: ValidationStatus = "valid"
+    validation_reasons: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MacroCycleAssessment(_StrictModel):
+    status: Literal["supported", "partial", "insufficient"] = "insufficient"
+    quadrant: Literal["goldilocks", "reflation", "slowdown", "stagflation", "undetermined"] = "undetermined"
+    growth_direction: Literal["rising", "falling", "mixed", "unknown"] = "unknown"
+    inflation_direction: Literal["rising", "falling", "mixed", "unknown"] = "unknown"
+    summary: str = "宏观证据不足"
+    evidence_ids: List[str] = Field(default_factory=list)
+    missing_series: List[str] = Field(default_factory=list)
+    next_releases: List[str] = Field(default_factory=list)
+
+
+class SecFact(_StrictModel):
+    evidence_id: str
+    ticker: str
+    cik: str
+    concept: str
+    label: str
+    value: float
+    unit: str
+    period_end: str
+    filed_at: str
+    form: str
+    accession: str
+    source_url: str
+    validation_status: ValidationStatus = "valid"
+
+
+class CompanyEvidence(_StrictModel):
+    ticker: str
+    status: Literal["available", "disabled", "partial", "unavailable"]
+    recent_forms: List[str] = Field(default_factory=list)
+    facts: List[SecFact] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
 class NewsEvidence(_StrictModel):
     evidence_id: str
     category: str
@@ -58,6 +110,22 @@ class NewsEvidence(_StrictModel):
     validation_status: ValidationStatus = "unverified"
     validation_reasons: List[str] = Field(default_factory=list)
     http_status: Optional[int] = None
+
+
+class NewsCluster(_StrictModel):
+    cluster_id: str
+    topic: str
+    canonical_title: str
+    member_evidence_ids: List[str]
+    source_domains: List[str]
+    source_tier: Literal["official", "tier1", "tier2", "tier3"]
+    independent_source_count: int = Field(ge=1)
+    primary_source_present: bool = False
+    corroboration_status: Literal["confirmed", "corroborated", "single_source", "unverified"]
+    first_seen_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+    summary: str = ""
+    contradictions: List[str] = Field(default_factory=list)
 
 
 class SymbolChange(_StrictModel):
@@ -140,6 +208,27 @@ class AIIntelligence(_StrictModel):
     warnings: List[str] = Field(default_factory=list)
 
 
+class ReportAuditFinding(_StrictModel):
+    code: str
+    severity: Literal["info", "warning", "critical"]
+    message: str
+    claim: Optional[str] = None
+    evidence_ids: List[str] = Field(default_factory=list)
+
+
+class ReportAuditResult(_StrictModel):
+    passed: bool = True
+    notification_allowed: bool = True
+    findings: List[ReportAuditFinding] = Field(default_factory=list)
+
+
+class DeliveryDecision(_StrictModel):
+    mode: Literal["full", "delta", "suppress"] = "full"
+    reason: str
+    material_event_ids: List[str] = Field(default_factory=list)
+    fingerprint: str = ""
+
+
 class DataQualitySummary(_StrictModel):
     quote_coverage_pct: float = Field(ge=0, le=100)
     fresh_quote_pct: float = Field(ge=0, le=100)
@@ -159,11 +248,17 @@ class USMarketIntelligenceSnapshot(_StrictModel):
     market_session: MarketSession
     session_label: str
     quotes: List[QuoteFact]
+    macro_facts: List[MacroFact] = Field(default_factory=list)
+    macro_cycle: MacroCycleAssessment = Field(default_factory=MacroCycleAssessment)
+    company_evidence: List[CompanyEvidence] = Field(default_factory=list)
     news: List[NewsEvidence]
+    news_clusters: List[NewsCluster] = Field(default_factory=list)
     comparison: SnapshotComparison = Field(default_factory=SnapshotComparison)
     anomalies: List[MarketAnomaly] = Field(default_factory=list)
     intelligence: AIIntelligence = Field(default_factory=AIIntelligence)
     data_quality: DataQualitySummary
+    audit: ReportAuditResult = Field(default_factory=ReportAuditResult)
+    delivery: Optional[DeliveryDecision] = None
     warnings: List[str] = Field(default_factory=list)
     report_markdown: Optional[str] = None
 

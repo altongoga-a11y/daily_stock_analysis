@@ -776,6 +776,15 @@ def build_machine_intelligence(snapshot: USMarketIntelligenceSnapshot) -> AIInte
             )
         )
 
+    for fact in snapshot.macro_facts:
+        claims.append(
+            IntelligenceClaim(
+                statement=f"{fact.name} 最新值 {fact.value} {fact.unit}（{fact.period}）",
+                kind="confirmed_fact",
+                evidence_ids=[fact.evidence_id],
+                confidence=0.99,
+            )
+        )
     if snapshot.news:
         claims.append(
             IntelligenceClaim(
@@ -818,6 +827,7 @@ def build_prompt(data: USMarketIntelligenceData, snapshot: Optional[USMarketInte
     ][:12]
     comparison_lines: list[str] = []
     anomaly_lines: list[str] = []
+    authoritative_lines: list[str] = []
     if snapshot is not None:
         for label, block in (
             ("上一小时", snapshot.comparison.previous_hour),
@@ -835,6 +845,17 @@ def build_prompt(data: USMarketIntelligenceData, snapshot: Optional[USMarketInte
             f"evidence={','.join(item.evidence_ids)}"
             for item in snapshot.anomalies
         ]
+        authoritative_lines = [
+            f"- [宏观事实] {fact.name}={fact.value} {fact.unit}, period={fact.period}, "
+            f"adjustment={fact.seasonal_adjustment}, evidence={fact.evidence_id}"
+            for fact in snapshot.macro_facts
+        ]
+        authoritative_lines.extend(
+            f"- [SEC事实] {fact.ticker} {fact.label}={fact.value} {fact.unit}, "
+            f"period={fact.period_end}, form={fact.form}, evidence={fact.evidence_id}"
+            for company in snapshot.company_evidence
+            for fact in company.facts[:5]
+        )
     return f"""你是一名严谨的美股跨资产市场策略师。请根据下方唯一可用的数据，生成中文 Markdown 情报正文。
 
 规则：
@@ -864,6 +885,9 @@ def build_prompt(data: USMarketIntelligenceData, snapshot: Optional[USMarketInte
 
 规则异常：
 {chr(10).join(anomaly_lines) or '- 未触发规则异常'}
+
+权威事实：
+{chr(10).join(authoritative_lines) or '- 无可用 BLS/SEC 权威事实'}
 
 数据告警：
 {chr(10).join(f'- {item}' for item in data.warnings) or '- 无'}
@@ -983,7 +1007,10 @@ def _sector_horizon_outlook(data: USMarketIntelligenceData) -> str:
     return "\n".join(lines)
 
 
-def _watchlist_opportunity_table(data: USMarketIntelligenceData) -> str:
+def _watchlist_opportunity_table(
+    data: USMarketIntelligenceData,
+    snapshot: Optional[USMarketIntelligenceSnapshot] = None,
+) -> str:
     spy = data.quotes.get("SPY")
     rows = []
     for quote in data.watchlist:
@@ -999,7 +1026,11 @@ def _watchlist_opportunity_table(data: USMarketIntelligenceData) -> str:
         score = sum(value or 0 for value in (relative_1d, relative_1m))
         rows.append((score, quote, relative_1d, relative_1m))
     rows.sort(key=lambda item: item[0], reverse=True)
-    lines = ["| 标的 | 当日相对SPY | 1月相对SPY | 观察结论 |", "|---|---:|---:|---|"]
+    sec_status = {item.ticker: item for item in (snapshot.company_evidence if snapshot else [])}
+    lines = [
+        "| 标的 | 当日相对SPY | 1月相对SPY | SEC证据 | 宏观适配 | 观察结论 |",
+        "|---|---:|---:|---|---|---|",
+    ]
     for _score, quote, relative_1d, relative_1m in rows[:8]:
         if relative_1d is not None and relative_1m is not None and relative_1d > 0 and relative_1m > 0:
             conclusion = "短中期相对强势，观察回撤承接"
@@ -1007,8 +1038,27 @@ def _watchlist_opportunity_table(data: USMarketIntelligenceData) -> str:
             conclusion = "当日抗跌/走强，等待中期确认"
         else:
             conclusion = "弱于基准，暂不作为优先方向"
+        company = sec_status.get(quote.symbol)
+        if company is None:
+            sec_label = "未采集"
+        elif company.status == "available":
+            sec_label = f"官方事实 {len(company.facts)} 条"
+        else:
+            sec_label = company.status
+        macro_label = "待定"
+        if snapshot is not None:
+            quadrant = snapshot.macro_cycle.quadrant
+            sector = quote.symbol
+            defensive = sector in {"WMT", "LLY", "NEE"}
+            if quadrant in {"slowdown", "stagflation"} and defensive:
+                macro_label = "防御适配"
+            elif quadrant in {"goldilocks", "reflation"}:
+                macro_label = "风险扩张适配"
+            elif quadrant == "undetermined":
+                macro_label = "周期未定"
         lines.append(
-            f"| {quote.symbol} | {_fmt_pct(relative_1d)} | {_fmt_pct(relative_1m)} | {conclusion} |"
+            f"| {quote.symbol} | {_fmt_pct(relative_1d)} | {_fmt_pct(relative_1m)} | "
+            f"{sec_label} | {macro_label} | {conclusion} |"
         )
     return "\n".join(lines) if rows else "暂无观察名单数据。"
 
@@ -1051,7 +1101,10 @@ def _quote_table(quotes: Iterable[QuotePoint], *, relative_to: Optional[float] =
     return "\n".join(lines) if count else "暂无可用数据。"
 
 
-def deterministic_report(data: USMarketIntelligenceData) -> str:
+def deterministic_report(
+    data: USMarketIntelligenceData,
+    snapshot: Optional[USMarketIntelligenceSnapshot] = None,
+) -> str:
     """Produce strategy-oriented analysis even when optional LLM synthesis fails."""
     macro = [data.quotes[symbol] for symbol in MACRO_SYMBOLS if symbol in data.quotes]
     valid_news = [item for item in data.news if item.validation_status == "valid"]
@@ -1060,15 +1113,29 @@ def deterministic_report(data: USMarketIntelligenceData) -> str:
         for item in valid_news
         if any(term in f"{item.title} {item.snippet}".lower() for term in ("cpi", "inflation", "payroll", "gdp", "fed", "jobs"))
     ]
-    macro_cycle_line = (
-        f"- **宏观经济周期：有 {len(macro_evidence)} 条已校验宏观证据，需结合其原始数据判断增长与通胀方向。**"
-        if macro_evidence
-        else "- **宏观经济周期：证据不足，暂不做扩张/放缓/衰退定性。** 当前报告只判断市场风险阶段。"
-    )
+    if snapshot is not None and snapshot.macro_cycle.status != "insufficient":
+        macro_cycle_line = (
+            f"- **宏观经济周期：{snapshot.macro_cycle.summary}。** "
+            f"增长方向={snapshot.macro_cycle.growth_direction}，"
+            f"通胀方向={snapshot.macro_cycle.inflation_direction}；"
+            f"缺失序列={', '.join(snapshot.macro_cycle.missing_series) or '无'}。"
+        )
+    else:
+        macro_cycle_line = (
+            f"- **宏观经济周期：有 {len(macro_evidence)} 条已校验宏观证据，但不足以完成四象限定性。**"
+            if macro_evidence
+            else "- **宏观经济周期：证据不足，暂不做扩张/放缓/衰退定性。** 当前报告只判断市场风险阶段。"
+        )
     sections = [
         "## 一、宏观周期与市场风险阶段",
         macro_cycle_line,
         "\n".join(_market_regime_summary(data)),
+        "### 未来7天高影响宏观日历",
+        (
+            "\n".join(f"- {item}" for item in snapshot.macro_cycle.next_releases)
+            if snapshot and snapshot.macro_cycle.next_releases
+            else "- 暂无已确认的高影响发布时间，或发布日历不可用。"
+        ),
         "## 二、金融故事主线与主要矛盾",
         "- 当前主线由风险偏好、利率/美元金融条件、盈利预期和行业相对强弱共同决定。",
         "- 主要矛盾应通过股指与 VIX、收益率与成长股、美元与商品、周期与防守板块是否互相验证来判断。",
@@ -1082,8 +1149,17 @@ def deterministic_report(data: USMarketIntelligenceData) -> str:
         "## 四、跨资产验证",
         _quote_table(macro),
         "## 五、值得关注的相对强势股票",
-        _watchlist_opportunity_table(data),
+        _watchlist_opportunity_table(data, snapshot),
         "## 六、新闻评价与主线映射",
+        (
+            "- 事件簇："
+            + "；".join(
+                f"{cluster.topic}/{cluster.corroboration_status}/{cluster.independent_source_count}源"
+                for cluster in (snapshot.news_clusters[:8] if snapshot else [])
+            )
+            if snapshot and snapshot.news_clusters
+            else "- 未形成可交叉验证的新闻事件簇。"
+        ),
         "\n".join(_news_assessment(item) for item in valid_news[:10])
         if valid_news
         else "暂无通过链接与发布时间校验的新闻，不对驱动因素作确认。",

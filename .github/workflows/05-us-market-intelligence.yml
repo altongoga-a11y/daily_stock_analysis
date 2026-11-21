@@ -70,6 +70,9 @@ jobs:
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
           BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
+          BLS_REGISTRATION_KEY: ${{ secrets.BLS_REGISTRATION_KEY }}
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+          FXMACRODATA_API_KEY: ${{ secrets.FXMACRODATA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}

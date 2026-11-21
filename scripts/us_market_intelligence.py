@@ -23,6 +23,10 @@ from src.services.us_market_intelligence import (  # noqa: E402
     should_run_scheduled,
 )
 from src.services.us_market_intelligence_engine import run_intelligence_engine  # noqa: E402
+from src.services.us_market_intelligence_delivery import (  # noqa: E402
+    DeliveryLedger,
+    decide_delivery,
+)
 from src.services.us_market_intelligence_history import USMarketIntelligenceHistory  # noqa: E402
 
 logger = logging.getLogger("us_market_intelligence")
@@ -156,6 +160,7 @@ def main() -> int:
         generate=generator,
         history=history,
         validate_news_links=not args.sample,
+        collect_authoritative_evidence=not args.sample,
     )
     report = result.report
     generation = "/".join(
@@ -163,6 +168,10 @@ def main() -> int:
     ) or result.snapshot.intelligence.status
     report += f"\n\n<!-- generation: {generation} -->\n"
     result.snapshot.report_markdown = report
+    ledger = DeliveryLedger(PROJECT_ROOT / args.history_dir / "delivery-state.json")
+    result.snapshot.delivery = decide_delivery(result.snapshot, previous_state=ledger.load())
+    if result.history_path is not None:
+        history.save(result.snapshot)
 
     output_path = PROJECT_ROOT / args.output
     json_output_path = PROJECT_ROOT / args.json_output
@@ -192,12 +201,43 @@ def main() -> int:
 
     if args.sample or args.no_send:
         return 0
+    if not result.snapshot.audit.notification_allowed:
+        logger.error("Notification blocked by factual audit")
+        return 3
+    if result.snapshot.delivery and result.snapshot.delivery.mode == "suppress":
+        logger.info("Telegram delivery suppressed: %s", result.snapshot.delivery.reason)
+        return 0
 
     from src.notification_sender.telegram_sender import TelegramSender
 
-    if not TelegramSender(config).send_to_telegram(report, timeout_seconds=15):
+    send_content = report
+    if result.snapshot.delivery and result.snapshot.delivery.mode == "delta":
+        event_labels = {
+            **{item.anomaly_id: item.reason for item in result.snapshot.anomalies},
+            **{item.cluster_id: f"{item.topic}: {item.canonical_title}（{item.corroboration_status}）" for item in result.snapshot.news_clusters},
+            **{
+                fact.evidence_id: f"{fact.ticker} {fact.label} {fact.form}/{fact.period_end}"
+                for company in result.snapshot.company_evidence
+                for fact in company.facts
+            },
+        }
+        events = "\n".join(
+            f"- {event_labels.get(item, item)} [{item}]"
+            for item in result.snapshot.delivery.material_event_ids[:12]
+        ) or "- 主线、风险阶段或宏观周期指纹发生变化"
+        send_content = (
+            f"# 🇺🇸 美股盘中增量情报\n\n快照 ID：{result.snapshot.snapshot_id}\n\n"
+            f"变化原因：{result.snapshot.delivery.reason}\n\n新增事件：\n{events}\n\n"
+            f"市场状态：{result.snapshot.intelligence.market_state}\n"
+            f"风险偏好：{result.snapshot.intelligence.risk_appetite}\n"
+            f"行业轮动：{result.snapshot.intelligence.sector_rotation}\n\n"
+            "完整 Markdown 与 JSON 已保存到本次 Actions artifact。"
+        )
+    if not TelegramSender(config).send_to_telegram(send_content, timeout_seconds=15):
         logger.error("Telegram delivery failed")
         return 2
+    if result.snapshot.delivery:
+        ledger.record(result.snapshot, result.snapshot.delivery)
     logger.info("Telegram delivery succeeded")
     return 0
 

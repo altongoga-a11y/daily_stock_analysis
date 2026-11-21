@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -20,9 +21,17 @@ from src.services.us_market_intelligence import (
     deterministic_report,
     run_us_market_intelligence,
 )
+from src.services.us_macro_intelligence import (
+    assess_macro_cycle,
+    fetch_bls_macro_facts,
+    fetch_fxmacro_release_calendar,
+)
 from src.services.us_market_intelligence_anomalies import detect_market_anomalies
+from src.services.us_market_intelligence_audit import audit_snapshot
 from src.services.us_market_intelligence_comparison import compare_with_baselines
 from src.services.us_market_intelligence_history import USMarketIntelligenceHistory
+from src.services.us_news_intelligence import cluster_news
+from src.services.us_sec_intelligence import collect_sec_evidence
 
 
 @dataclass
@@ -42,6 +51,7 @@ def run_intelligence_engine(
     generate: Optional[Callable[[str], tuple[str, str, str]]] = None,
     history: Optional[USMarketIntelligenceHistory] = None,
     validate_news_links: bool = True,
+    collect_authoritative_evidence: bool = True,
 ) -> USMarketIntelligenceRunResult:
     data = run_us_market_intelligence(
         config,
@@ -51,6 +61,25 @@ def run_intelligence_engine(
         validate_news_links=validate_news_links,
     )
     snapshot = build_structured_snapshot(data)
+    if collect_authoritative_evidence:
+        macro_facts, macro_warnings = fetch_bls_macro_facts(
+            now=data.generated_at,
+            registration_key=os.getenv("BLS_REGISTRATION_KEY") or getattr(config, "bls_registration_key", None),
+        )
+        next_releases, calendar_warnings = fetch_fxmacro_release_calendar(
+            now=data.generated_at,
+            api_key=os.getenv("FXMACRODATA_API_KEY"),
+        )
+        snapshot.macro_facts = macro_facts
+        snapshot.macro_cycle = assess_macro_cycle(macro_facts, next_releases=next_releases)
+        data.warnings.extend([*macro_warnings, *calendar_warnings])
+        snapshot.company_evidence = collect_sec_evidence(
+            list(watchlist),
+            os.getenv("SEC_USER_AGENT") or getattr(config, "sec_user_agent", None),
+        )
+    snapshot.news_clusters = cluster_news(
+        [item for item in snapshot.news if item.validation_status == "valid"]
+    )
 
     previous_hour = None
     previous_day = None
@@ -78,7 +107,7 @@ def run_intelligence_engine(
             generation_error = f"{type(exc).__name__}: {str(exc)[:240]}"
     if generation_error:
         data.warnings.append(f"LLM 生成失败：{generation_error}")
-    strategy_body = deterministic_report(data)
+    strategy_body = deterministic_report(data, snapshot)
     if analysis_body:
         snapshot.intelligence.status = "generated"
         snapshot.intelligence.narrative_markdown = analysis_body
@@ -95,6 +124,7 @@ def run_intelligence_engine(
 
     report = compose_report(data, report_body, snapshot)
     snapshot.report_markdown = report
+    snapshot.audit = audit_snapshot(snapshot, report)
     snapshot.warnings = list(dict.fromkeys([*snapshot.warnings, *data.warnings]))
     history_path = history.save(snapshot) if history is not None else None
     return USMarketIntelligenceRunResult(
